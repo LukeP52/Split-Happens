@@ -57,7 +57,8 @@ class GroupViewModel: ObservableObject {
         
         do {
             let fetchedGroups = try await cloudKitManager.fetchGroupsAsModels()
-            groups = fetchedGroups
+            // Deduplicate groups by ID and name+participants
+            groups = deduplicateGroups(fetchedGroups)
         } catch {
             errorMessage = "Failed to load groups: \(error.localizedDescription)"
         }
@@ -69,6 +70,14 @@ class GroupViewModel: ObservableObject {
         isLoading = true
         errorMessage = nil
         
+        // Check for local duplicates first
+        if let existingGroup = findDuplicateGroup(name: name, participants: participants) {
+            print("⚠️ Found local duplicate group: \(existingGroup.name)")
+            errorMessage = "A group with this name and participants already exists"
+            isLoading = false
+            return
+        }
+        
         let newGroup = Group(
             name: name,
             participants: participants,
@@ -78,7 +87,15 @@ class GroupViewModel: ObservableObject {
         
         do {
             let savedGroup = try await cloudKitManager.saveGroup(newGroup)
-            groups.append(savedGroup)
+            // Check if group already exists in local array before adding
+            if !groups.contains(where: { $0.id == savedGroup.id }) {
+                groups.append(savedGroup)
+            } else {
+                // Update existing group if found
+                if let index = groups.firstIndex(where: { $0.id == savedGroup.id }) {
+                    groups[index] = savedGroup
+                }
+            }
         } catch {
             errorMessage = "Failed to create group: \(error.localizedDescription)"
         }
@@ -109,12 +126,34 @@ class GroupViewModel: ObservableObject {
         do {
             let record = group.toCKRecord()
             try await cloudKitManager.deleteGroup(record)
-            groups.removeAll { $0.id == group.id }
+            
+            // Remove from local array
+            await MainActor.run {
+                groups.removeAll { $0.id == group.id }
+            }
         } catch {
             errorMessage = "Failed to delete group: \(error.localizedDescription)"
         }
         
         isLoading = false
+    }
+    
+    // Add periodic sync to catch deletions
+    func startPeriodicSync() {
+        Timer.scheduledTimer(withTimeInterval: 30.0, repeats: true) { _ in
+            Task {
+                await self.syncWithCloudKit()
+            }
+        }
+    }
+    
+    private func syncWithCloudKit() async {
+        do {
+            try await cloudKitManager.syncDeletedGroups()
+            await loadGroups()
+        } catch {
+            print("❌ Periodic sync failed: \(error)")
+        }
     }
     
     func addParticipant(to group: Group, participant: String) async {
@@ -141,6 +180,109 @@ class GroupViewModel: ObservableObject {
     
     func sortedGroups() -> [Group] {
         return groups.sorted { $0.lastActivity > $1.lastActivity }
+    }
+    
+    // MARK: - Deduplication
+    
+    private func findDuplicateGroup(name: String, participants: [String]) -> Group? {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        
+        for group in groups {
+            // Check if name matches
+            if group.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == trimmedName.lowercased() {
+                // Check participant overlap (75% or more indicates duplicate)
+                let participantSet1 = Set(group.participants.map { $0.lowercased().trimmingCharacters(in: .whitespacesAndNewlines) })
+                let participantSet2 = Set(participants.map { $0.lowercased().trimmingCharacters(in: .whitespacesAndNewlines) })
+                
+                let intersection = participantSet1.intersection(participantSet2)
+                let union = participantSet1.union(participantSet2)
+                
+                if !union.isEmpty {
+                    let overlapPercentage = Double(intersection.count) / Double(union.count)
+                    if overlapPercentage >= 0.75 {
+                        return group
+                    }
+                }
+            }
+        }
+        
+        return nil
+    }
+    
+    private func deduplicateGroups(_ groups: [Group]) -> [Group] {
+        var uniqueGroups: [Group] = []
+        var seenIdentifiers: Set<String> = Set()
+        var seenGroupHashes: Set<String> = Set()
+        
+        for group in groups {
+            // First check by ID
+            if seenIdentifiers.contains(group.id) {
+                continue
+            }
+            
+            // Then check by content hash (name + participants)
+            let contentHash = createGroupHash(group)
+            if seenGroupHashes.contains(contentHash) {
+                continue
+            }
+            
+            // Check for similar groups with different IDs
+            if let existingGroup = findSimilarGroup(group, in: uniqueGroups) {
+                // Merge groups - keep the one with more recent activity
+                if group.lastActivity > existingGroup.lastActivity {
+                    // Replace existing with newer group
+                    if let index = uniqueGroups.firstIndex(where: { $0.id == existingGroup.id }) {
+                        uniqueGroups[index] = group
+                        seenIdentifiers.insert(group.id)
+                        seenGroupHashes.insert(contentHash)
+                    }
+                }
+                // Otherwise keep existing group
+                continue
+            }
+            
+            uniqueGroups.append(group)
+            seenIdentifiers.insert(group.id)
+            seenGroupHashes.insert(contentHash)
+        }
+        
+        print("🔍 Deduplicated \\(groups.count) groups to \\(uniqueGroups.count) unique groups")
+        return uniqueGroups
+    }
+    
+    private func createGroupHash(_ group: Group) -> String {
+        let participants = group.participants.sorted().joined(separator: "|")
+        return "\\(group.name.lowercased())_\\(participants.lowercased())"
+    }
+    
+    private func findSimilarGroup(_ group: Group, in groups: [Group]) -> Group? {
+        for existingGroup in groups {
+            if existingGroup.id == group.id {
+                continue
+            }
+            
+            // Check name similarity
+            let namesSimilar = existingGroup.name.lowercased().trimmingCharacters(in: .whitespacesAndNewlines) == 
+                              group.name.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+            
+            if namesSimilar {
+                // Check participant overlap
+                let participantSet1 = Set(existingGroup.participants.map { $0.lowercased().trimmingCharacters(in: .whitespacesAndNewlines) })
+                let participantSet2 = Set(group.participants.map { $0.lowercased().trimmingCharacters(in: .whitespacesAndNewlines) })
+                
+                let intersection = participantSet1.intersection(participantSet2)
+                let union = participantSet1.union(participantSet2)
+                
+                if !union.isEmpty {
+                    let overlapPercentage = Double(intersection.count) / Double(union.count)
+                    if overlapPercentage >= 0.8 { // 80% overlap indicates likely duplicate
+                        return existingGroup
+                    }
+                }
+            }
+        }
+        
+        return nil
     }
     
     // MARK: - Error Handling

@@ -213,6 +213,9 @@ class CloudKitManager: ObservableObject {
                 return .recordNotFound
             case .invalidArguments, .incompatibleVersion:
                 return .invalidData
+            case .serverRecordChanged:
+                print("⚠️ Server record changed error - should be handled by conflict resolution")
+                return .unknown(error)
             default:
                 return .unknown(error)
             }
@@ -255,8 +258,27 @@ class CloudKitManager: ObservableObject {
     }
     
     func deleteGroup(_ record: CKRecord) async throws {
+        let groupID = record.recordID.recordName
+        
+        // Delete from CloudKit
         try await performWithRetry {
             try await self.database.deleteRecord(withID: record.recordID)
+        }
+        
+        // Delete from local storage
+        await MainActor.run {
+            let offlineManager = OfflineStorageManager.shared
+            var localGroups = offlineManager.loadGroups()
+            localGroups.removeAll { $0.id == groupID }
+            offlineManager.saveGroups(localGroups)
+            
+            // Also delete all associated expenses
+            var localExpenses = offlineManager.loadExpenses()
+            localExpenses.removeAll { $0.groupReference == groupID }
+            offlineManager.saveExpenses(localExpenses)
+            
+            // Update sync status
+            offlineManager.updateSyncStatus(for: groupID, status: .synced)
         }
     }
     
@@ -388,33 +410,177 @@ class CloudKitManager: ObservableObject {
             validatedGroup.participantIDs = group.participants.map { _ in UUID().uuidString }
         }
         
-        // Ensure finite values
-        if !validatedGroup.totalSpent.isFinite {
-            print("⚠️ Fixing non-finite totalSpent: \(validatedGroup.totalSpent)")
-            validatedGroup.totalSpent = 0
-        }
+        // Ensure finite values using safeValue
+        validatedGroup.totalSpent = validatedGroup.totalSpent.safeValue
         
         guard validateGroup(validatedGroup) else {
             print("❌ Group validation failed after fixes")
             throw CloudKitManagerError.invalidData
         }
         
-        let record = validatedGroup.toCKRecord()
+        // Check if group already exists
+        let recordID = CKRecord.ID(recordName: group.id)
         
-        // Validate record before saving
-        for key in ["name", "participants", "participantIDs", "totalSpent", "lastActivity", "isActive", "currency"] {
-            if record[key] == nil {
-                print("❌ Missing required field in CKRecord: \(key)")
+        do {
+            // Try to fetch existing record
+            let existingRecord = try await performWithRetry {
+                try await self.database.record(for: recordID)
+            }
+            
+            // Update existing record
+            existingRecord["name"] = validatedGroup.name
+            existingRecord["participants"] = validatedGroup.participants
+            existingRecord["participantIDs"] = validatedGroup.participantIDs
+            existingRecord["totalSpent"] = validatedGroup.totalSpent.safeValue
+            existingRecord["lastActivity"] = validatedGroup.lastActivity
+            existingRecord["isActive"] = validatedGroup.isActive
+            existingRecord["currency"] = validatedGroup.currency
+            
+            let savedRecord = try await performWithRetry {
+                try await self.database.save(existingRecord)
+            }
+            
+            guard let updatedGroup = Group(from: savedRecord) else {
                 throw CloudKitManagerError.invalidData
+            }
+            
+            print("✅ Updated existing group: \(updatedGroup.name)")
+            return updatedGroup
+            
+        } catch {
+            // If record doesn't exist, create new one
+            if let ckError = error as? CKError, ckError.code == .unknownItem {
+                let newRecord = validatedGroup.toCKRecord()
+                
+                let savedRecord = try await performWithRetry {
+                    try await self.database.save(newRecord)
+                }
+                
+                guard let newGroup = Group(from: savedRecord) else {
+                    throw CloudKitManagerError.invalidData
+                }
+                
+                print("✅ Created new group: \(newGroup.name)")
+                return newGroup
+            }
+            
+            throw error
+        }
+    }
+    
+    private func saveGroupWithConflictResolution(_ record: CKRecord) async throws -> CKRecord {
+        do {
+            return try await self.database.save(record)
+        } catch {
+            if let ckError = error as? CKError {
+                switch ckError.code {
+                case .serverRecordChanged:
+                    print("⚠️ Server record changed, attempting to resolve conflict")
+                    return try await resolveGroupConflict(record, serverError: ckError)
+                case .unknownItem:
+                    // Record doesn't exist, safe to create
+                    record.setValue(Date(), forKey: "lastActivity")
+                    return try await self.database.save(record)
+                default:
+                    throw error
+                }
+            }
+            throw error
+        }
+    }
+    
+    private func resolveGroupConflict(_ record: CKRecord, serverError: CKError) async throws -> CKRecord {
+        // Get the server record from the error
+        guard let serverRecord = serverError.userInfo[CKRecordChangedErrorServerRecordKey] as? CKRecord else {
+            // If we can't get the server record, fetch it manually
+            let fetchedRecord = try await database.record(for: record.recordID)
+            return try await mergeGroupRecords(local: record, server: fetchedRecord)
+        }
+        
+        return try await mergeGroupRecords(local: record, server: serverRecord)
+    }
+    
+    private func mergeGroupRecords(local: CKRecord, server: CKRecord) async throws -> CKRecord {
+        // Merge strategy: keep the most recent data
+        let localLastActivity = local["lastActivity"] as? Date ?? Date.distantPast
+        let serverLastActivity = server["lastActivity"] as? Date ?? Date.distantPast
+        
+        let mergedRecord = server // Start with server record
+        
+        // If local is more recent, update server record with local changes
+        if localLastActivity > serverLastActivity {
+            print("🔄 Local record is newer, updating server record")
+            mergedRecord["name"] = local["name"]
+            mergedRecord["participants"] = local["participants"]
+            mergedRecord["participantIDs"] = local["participantIDs"]
+            mergedRecord["currency"] = local["currency"]
+            mergedRecord["isActive"] = local["isActive"]
+        }
+        
+        // Always merge totalSpent (combine if different)
+        let localTotal = local["totalSpent"] as? Double ?? 0
+        let serverTotal = server["totalSpent"] as? Double ?? 0
+        
+        if localTotal != serverTotal {
+            // Keep the higher total (assuming expenses were added)
+            mergedRecord["totalSpent"] = max(localTotal, serverTotal)
+        }
+        
+        mergedRecord["lastActivity"] = max(localLastActivity, serverLastActivity)
+        
+        return try await self.database.save(mergedRecord)
+    }
+    
+    private func checkForDuplicateGroup(_ group: Group) async throws -> Group? {
+        // Search for groups with same name and similar participants
+        let predicate = NSPredicate(format: "name == %@ AND isActive == %@", group.name, NSNumber(value: true))
+        let query = CKQuery(recordType: "Group", predicate: predicate)
+        
+        do {
+            let (matchResults, _) = try await database.records(matching: query)
+            
+            for (_, result) in matchResults {
+                switch result {
+                case .success(let record):
+                    if let existingGroup = Group(from: record) {
+                        // Check if participants overlap significantly (75% or more)
+                        let overlap = Set(group.participants).intersection(Set(existingGroup.participants))
+                        let overlapPercentage = Double(overlap.count) / Double(max(group.participants.count, existingGroup.participants.count))
+                        
+                        if overlapPercentage >= 0.75 {
+                            return existingGroup
+                        }
+                    }
+                case .failure:
+                    continue
+                }
+            }
+        } catch {
+            print("⚠️ Error checking for duplicates: \(error)")
+            // Continue with save if duplicate check fails
+        }
+        
+        return nil
+    }
+    
+    private func updateExistingGroup(_ existingGroup: Group, with newGroup: Group) async throws -> Group {
+        var mergedGroup = existingGroup
+        
+        // Merge participants (add any new ones)
+        for participant in newGroup.participants {
+            if !mergedGroup.participants.contains(participant) {
+                mergedGroup.addParticipant(participant)
             }
         }
         
-        let savedRecord = try await performWithRetry {
-            try await self.database.save(record)
-        }
+        // Update other fields if the new group has more recent data
+        mergedGroup.lastActivity = max(existingGroup.lastActivity, newGroup.lastActivity)
+        
+        // Save the merged group
+        let record = mergedGroup.toCKRecord()
+        let savedRecord = try await self.database.save(record)
         
         guard let updatedGroup = Group(from: savedRecord) else {
-            print("❌ Failed to convert saved record back to Group")
             throw CloudKitManagerError.invalidData
         }
         
@@ -444,15 +610,84 @@ class CloudKitManager: ObservableObject {
             throw CloudKitManagerError.invalidData
         }
         
+        // Check for duplicate expenses
+        if let existingExpense = try await checkForDuplicateExpense(expense) {
+            print("⚠️ Found duplicate expense, returning existing: \(existingExpense.description)")
+            return existingExpense
+        }
+        
         let record = expense.toCKRecord()
         let savedRecord = try await performWithRetry {
-            try await self.database.save(record)
+            try await self.saveExpenseWithConflictResolution(record)
         }
         guard let updatedExpense = Expense(from: savedRecord) else {
             print("Failed to convert saved record back to Expense")
             throw CloudKitManagerError.invalidData
         }
         return updatedExpense
+    }
+    
+    private func saveExpenseWithConflictResolution(_ record: CKRecord) async throws -> CKRecord {
+        do {
+            return try await self.database.save(record)
+        } catch {
+            if let ckError = error as? CKError {
+                switch ckError.code {
+                case .serverRecordChanged:
+                    print("⚠️ Server expense record changed, attempting to resolve conflict")
+                    return try await resolveExpenseConflict(record, serverError: ckError)
+                case .unknownItem:
+                    // Record doesn't exist, safe to create
+                    record.setValue(Date(), forKey: "date")
+                    return try await self.database.save(record)
+                default:
+                    throw error
+                }
+            }
+            throw error
+        }
+    }
+    
+    private func resolveExpenseConflict(_ record: CKRecord, serverError: CKError) async throws -> CKRecord {
+        // For expenses, prefer the server record to avoid duplicates
+        guard let serverRecord = serverError.userInfo[CKRecordChangedErrorServerRecordKey] as? CKRecord else {
+            let fetchedRecord = try await database.record(for: record.recordID)
+            return fetchedRecord
+        }
+        
+        return serverRecord
+    }
+    
+    private func checkForDuplicateExpense(_ expense: Expense) async throws -> Expense? {
+        // Search for expenses with same description, amount, and group within a small time window
+        let groupReference = CKRecord.Reference(recordID: CKRecord.ID(recordName: expense.groupReference), action: .none)
+        let predicate = NSPredicate(format: "groupReference == %@ AND description == %@ AND totalAmount == %@", 
+                                  groupReference, expense.description, NSNumber(value: expense.totalAmount))
+        let query = CKQuery(recordType: "Expense", predicate: predicate)
+        
+        do {
+            let (matchResults, _) = try await database.records(matching: query)
+            
+            for (_, result) in matchResults {
+                switch result {
+                case .success(let record):
+                    if let existingExpense = Expense(from: record) {
+                        // Check if the expense was created within the last 5 minutes (likely duplicate)
+                        let timeDifference = abs(existingExpense.date.timeIntervalSince(expense.date))
+                        if timeDifference < 300 { // 5 minutes
+                            return existingExpense
+                        }
+                    }
+                case .failure:
+                    continue
+                }
+            }
+        } catch {
+            print("⚠️ Error checking for duplicate expenses: \(error)")
+            // Continue with save if duplicate check fails
+        }
+        
+        return nil
     }
     
     private func validateExpense(_ expense: Expense) -> Bool {
@@ -477,6 +712,20 @@ class CloudKitManager: ObservableObject {
             return false
         }
         return true
+    }
+    
+    func fetchGroup(by groupID: String) async throws -> Group? {
+        let recordID = CKRecord.ID(recordName: groupID)
+        
+        do {
+            let record = try await database.record(for: recordID)
+            return Group(from: record)
+        } catch {
+            if let ckError = error as? CKError, ckError.code == .unknownItem {
+                return nil // Group not found
+            }
+            throw error
+        }
     }
     
     func fetchGroupsAsModels() async throws -> [Group] {

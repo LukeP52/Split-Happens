@@ -111,6 +111,12 @@ class ExpenseViewModel: ObservableObject {
         do {
             let savedExpense = try await cloudKitManager.saveExpense(newExpense)
             expenses.append(savedExpense)
+            
+            // Update the group's total spent amount
+            await updateGroupTotal(groupID: groupID)
+            
+            // Notify that groups data has changed so the main view refreshes
+            NotificationCenter.default.post(name: .groupsDidChange, object: nil)
         } catch {
             errorMessage = "Failed to create expense: \(error.localizedDescription)"
         }
@@ -118,15 +124,21 @@ class ExpenseViewModel: ObservableObject {
         isLoading = false
     }
     
-    func updateExpense(_ expense: Expense) async {
+    func updateExpense(_ originalExpense: Expense, _ updatedExpense: Expense) async {
         isLoading = true
         errorMessage = nil
         
         do {
-            let updatedExpense = try await cloudKitManager.saveExpense(expense)
-            if let index = expenses.firstIndex(where: { $0.id == expense.id }) {
-                expenses[index] = updatedExpense
+            let savedExpense = try await cloudKitManager.saveExpense(updatedExpense)
+            if let index = expenses.firstIndex(where: { $0.id == originalExpense.id }) {
+                expenses[index] = savedExpense
             }
+            
+            // Update the group's total spent amount (recalculate from all expenses)
+            await updateGroupTotal(groupID: updatedExpense.groupReference)
+            
+            // Notify that groups data has changed so the main view refreshes
+            NotificationCenter.default.post(name: .groupsDidChange, object: nil)
         } catch {
             errorMessage = "Failed to update expense: \(error.localizedDescription)"
         }
@@ -142,11 +154,45 @@ class ExpenseViewModel: ObservableObject {
             let record = expense.toCKRecord()
             try await cloudKitManager.deleteExpense(record)
             expenses.removeAll { $0.id == expense.id }
+            
+            // Update the group's total spent amount (recalculate from all expenses)
+            await updateGroupTotal(groupID: expense.groupReference)
+            
+            // Notify that groups data has changed so the main view refreshes
+            NotificationCenter.default.post(name: .groupsDidChange, object: nil)
         } catch {
             errorMessage = "Failed to delete expense: \(error.localizedDescription)"
         }
         
         isLoading = false
+    }
+    
+    // MARK: - Group Total Management
+    
+    private func updateGroupTotal(groupID: String) async {
+        do {
+            // Fetch the current group
+            guard let group = try await cloudKitManager.fetchGroup(by: groupID) else {
+                print("Could not find group with ID: \(groupID)")
+                return
+            }
+            
+            // Recalculate total from all expenses to ensure accuracy
+            let allExpenses = try await cloudKitManager.fetchExpensesAsModels(for: groupID)
+            let newTotal = allExpenses.reduce(0) { $0 + $1.totalAmount.safeValue }
+            
+            // Update the group with the recalculated total
+            var updatedGroup = group
+            updatedGroup.totalSpent = newTotal
+            
+            // Save the updated group back to CloudKit
+            _ = try await cloudKitManager.saveGroup(updatedGroup)
+            
+            print("Recalculated group \(groupID) total: \(newTotal)")
+        } catch {
+            print("Failed to update group total: \(error.localizedDescription)")
+            // Don't throw the error as this is a secondary operation
+        }
     }
     
     // MARK: - Balance Calculations
@@ -202,7 +248,13 @@ class ExpenseViewModel: ObservableObject {
     }
     
     func averageAmount() -> Double {
-        return expenses.isEmpty ? 0 : totalAmount() / Double(expenses.count)
+        guard !expenses.isEmpty else { return 0 }
+        let total = totalAmount()
+        guard total.isFinite else { return 0 }
+        let count = Double(expenses.count)
+        guard count > 0 else { return 0 }
+        let result = total / count
+        return result.isFinite ? result : 0
     }
     
     // MARK: - Error Handling

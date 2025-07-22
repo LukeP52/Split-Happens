@@ -389,10 +389,11 @@ class OfflineStorageManager: ObservableObject {
     }
     
     private func syncRemoteChanges() async {
-        // In a real implementation, this would:
-        // 1. Fetch changes from CloudKit since lastSyncTime
-        // 2. Apply remote changes locally
-        // 3. Handle conflicts using last-write-wins
+        // Enhanced implementation that:
+        // 1. Syncs deletions from CloudKit
+        // 2. Fetch changes from CloudKit since lastSyncTime
+        // 3. Apply remote changes locally
+        // 4. Handle conflicts using last-write-wins
         
         let cloudKitManager = CloudKitManager.shared
         
@@ -403,10 +404,13 @@ class OfflineStorageManager: ObservableObject {
                 return
             }
             
+            // First, sync deletions
+            try await cloudKitManager.syncDeletedGroups()
+            
             let remoteGroups = try await cloudKitManager.fetchGroupsAsModels()
             print("✅ Fetched \(remoteGroups.count) remote groups")
             
-            // Validate groups before processing
+            // Validate and deduplicate groups before processing
             let validGroups = remoteGroups.filter { group in
                 let isValid = !group.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
                               group.participants.count >= 1 &&
@@ -418,10 +422,14 @@ class OfflineStorageManager: ObservableObject {
                 return isValid
             }
             
+            // Deduplicate groups
+            let uniqueGroups = deduplicateGroups(validGroups)
+            print("🔍 Deduplicated \(validGroups.count) groups to \(uniqueGroups.count) unique groups")
+            
             let localGroups = loadGroups()
             print("📱 Found \(localGroups.count) local groups")
             
-            let mergedGroups = mergeGroups(local: localGroups, remote: validGroups)
+            let mergedGroups = mergeGroups(local: localGroups, remote: uniqueGroups)
             print("🔀 Merged to \(mergedGroups.count) groups")
             saveGroups(mergedGroups)
             
@@ -438,6 +446,26 @@ class OfflineStorageManager: ObservableObject {
                 print("CloudKit error type: \(cloudKitError)")
             }
         }
+    }
+    
+    // Deduplicate groups based on name and participants
+    private func deduplicateGroups(_ groups: [Group]) -> [Group] {
+        var seen = Set<String>()
+        var uniqueGroups: [Group] = []
+        
+        for group in groups {
+            // Create a unique key based on name and sorted participants
+            let key = "\(group.name.lowercased())-\(group.participants.sorted().joined(separator: ","))"
+            
+            if !seen.contains(key) {
+                seen.insert(key)
+                uniqueGroups.append(group)
+            } else {
+                print("⚠️ Skipping duplicate group: \(group.name)")
+            }
+        }
+        
+        return uniqueGroups
     }
     
     private func syncExpensesWithConcurrency(groups: [Group], cloudKitManager: CloudKitManager) async {
