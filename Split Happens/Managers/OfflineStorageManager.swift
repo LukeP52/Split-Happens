@@ -389,62 +389,59 @@ class OfflineStorageManager: ObservableObject {
     }
     
     private func syncRemoteChanges() async {
-        // Enhanced implementation that:
-        // 1. Syncs deletions from CloudKit
-        // 2. Fetch changes from CloudKit since lastSyncTime
-        // 3. Apply remote changes locally
-        // 4. Handle conflicts using last-write-wins
-        
         let cloudKitManager = CloudKitManager.shared
         
         do {
-            // Clean version without debug prints
             guard cloudKitManager.isSignedInToiCloud else {
                 print("❌ Not signed into iCloud, skipping sync")
                 return
             }
             
-            // First, sync deletions
-            try await cloudKitManager.syncDeletedGroups()
-            
+            // Fetch all remote groups
             let remoteGroups = try await cloudKitManager.fetchGroupsAsModels()
-            print("✅ Fetched \(remoteGroups.count) remote groups")
+            let remoteGroupIDs = Set(remoteGroups.map { $0.id })
             
-            // Validate and deduplicate groups before processing
-            let validGroups = remoteGroups.filter { group in
-                let isValid = !group.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
-                              group.participants.count >= 1 &&
-                              group.totalSpent.isFinite &&
-                              group.totalSpent >= 0
-                if !isValid {
-                    print("⚠️ Skipping invalid group: \(group.name)")
+            // Load local groups
+            var localGroups = loadGroups()
+            let localGroupIDs = Set(localGroups.map { $0.id })
+            
+            // Find groups that exist locally but not in CloudKit (deleted)
+            let deletedGroupIDs = localGroupIDs.subtracting(remoteGroupIDs)
+            
+            if !deletedGroupIDs.isEmpty {
+                print("🗑️ Removing \(deletedGroupIDs.count) deleted groups from local cache")
+                
+                // Remove deleted groups and their expenses
+                localGroups.removeAll { deletedGroupIDs.contains($0.id) }
+                saveGroups(localGroups)
+                
+                // Also remove associated expenses
+                var localExpenses = loadExpenses()
+                localExpenses.removeAll { deletedGroupIDs.contains($0.groupReference) }
+                saveExpenses(localExpenses)
+                
+                // Clear sync status for deleted items
+                for groupID in deletedGroupIDs {
+                    syncStatusItems.removeValue(forKey: groupID)
                 }
-                return isValid
+                saveSyncStatusItems()
             }
             
-            // Deduplicate groups
-            let uniqueGroups = deduplicateGroups(validGroups)
-            print("🔍 Deduplicated \(validGroups.count) groups to \(uniqueGroups.count) unique groups")
+            // Now sync remaining groups and add new ones
+            let validGroups = remoteGroups.filter { group in
+                !group.name.isEmpty && group.participants.count >= 1
+            }
             
-            let localGroups = loadGroups()
-            print("📱 Found \(localGroups.count) local groups")
-            
-            let mergedGroups = mergeGroups(local: localGroups, remote: uniqueGroups)
-            print("🔀 Merged to \(mergedGroups.count) groups")
+            let mergedGroups = mergeGroups(local: localGroups, remote: validGroups)
             saveGroups(mergedGroups)
             
-            // Only sync expenses for valid groups
+            // Sync expenses for each group
             await syncExpensesWithConcurrency(groups: mergedGroups, cloudKitManager: cloudKitManager)
             
             print("✅ Sync completed successfully")
             
         } catch {
             print("❌ Failed to sync remote changes: \(error)")
-            
-            // Don't print sensitive CloudKit error details in production
-            if let cloudKitError = error as? CloudKitManagerError {
-                print("CloudKit error type: \(cloudKitError)")
-            }
         }
     }
     

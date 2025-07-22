@@ -6,6 +6,7 @@ struct ModernGroupListView: View {
     @StateObject private var cloudKitManager = CloudKitManager.shared
     @StateObject private var offlineManager = OfflineStorageManager.shared
     @State private var showingCreateGroup = false
+    @State private var isLoadingGroups = false
     
     var filteredGroups: [Group] {
         groupViewModel.groups.filter { $0.isActive }
@@ -172,6 +173,10 @@ struct ModernGroupListView: View {
     }
     
     private func loadGroupsOfflineFirst() async {
+        guard !isLoadingGroups else { return }
+        isLoadingGroups = true
+        
+        // Load from cache immediately
         let cachedGroups = offlineManager.loadGroups()
         if !cachedGroups.isEmpty {
             await MainActor.run {
@@ -179,9 +184,12 @@ struct ModernGroupListView: View {
             }
         }
         
+        // Try to sync in background
         if offlineManager.isOnline {
             await groupViewModel.loadGroups()
         }
+        
+        isLoadingGroups = false
     }
     
 }

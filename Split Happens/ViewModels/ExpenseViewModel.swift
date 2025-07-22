@@ -172,26 +172,34 @@ class ExpenseViewModel: ObservableObject {
     private func updateGroupTotal(groupID: String) async {
         do {
             // Fetch the current group
-            guard let group = try await cloudKitManager.fetchGroup(by: groupID) else {
+            guard var group = try await cloudKitManager.fetchGroup(by: groupID) else {
                 print("Could not find group with ID: \(groupID)")
                 return
             }
             
-            // Recalculate total from all expenses to ensure accuracy
+            // Recalculate total from all expenses
             let allExpenses = try await cloudKitManager.fetchExpensesAsModels(for: groupID)
             let newTotal = allExpenses.reduce(0) { $0 + $1.totalAmount.safeValue }
             
-            // Update the group with the recalculated total
-            var updatedGroup = group
-            updatedGroup.totalSpent = newTotal
+            // Update the group with new total
+            group.totalSpent = newTotal
             
-            // Save the updated group back to CloudKit
-            _ = try await cloudKitManager.saveGroup(updatedGroup)
+            // Save the updated group
+            let savedGroup = try await cloudKitManager.saveGroup(group)
             
-            print("Recalculated group \(groupID) total: \(newTotal)")
+            // Update local cache
+            await MainActor.run {
+                let offlineManager = OfflineStorageManager.shared
+                var localGroups = offlineManager.loadGroups()
+                if let index = localGroups.firstIndex(where: { $0.id == groupID }) {
+                    localGroups[index] = savedGroup
+                    offlineManager.saveGroups(localGroups)
+                }
+            }
+            
+            print("Updated group \(groupID) total to: \(newTotal)")
         } catch {
             print("Failed to update group total: \(error.localizedDescription)")
-            // Don't throw the error as this is a secondary operation
         }
     }
     

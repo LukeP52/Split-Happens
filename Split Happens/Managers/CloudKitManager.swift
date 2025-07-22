@@ -260,26 +260,37 @@ class CloudKitManager: ObservableObject {
     func deleteGroup(_ record: CKRecord) async throws {
         let groupID = record.recordID.recordName
         
-        // Delete from CloudKit
+        // Delete all expenses for this group first
+        let expenses = try await fetchExpensesAsModels(for: groupID)
+        for expense in expenses {
+            let expenseRecord = expense.toCKRecord()
+            try await deleteExpense(expenseRecord)
+        }
+        
+        // Delete the group from CloudKit
         try await performWithRetry {
             try await self.database.deleteRecord(withID: record.recordID)
         }
         
-        // Delete from local storage
+        // Clean up local storage immediately
         await MainActor.run {
             let offlineManager = OfflineStorageManager.shared
+            
+            // Remove group
             var localGroups = offlineManager.loadGroups()
             localGroups.removeAll { $0.id == groupID }
             offlineManager.saveGroups(localGroups)
             
-            // Also delete all associated expenses
+            // Remove associated expenses
             var localExpenses = offlineManager.loadExpenses()
             localExpenses.removeAll { $0.groupReference == groupID }
             offlineManager.saveExpenses(localExpenses)
             
-            // Update sync status
+            // Clear sync status
             offlineManager.updateSyncStatus(for: groupID, status: .synced)
         }
+        
+        print("✅ Deleted group \(groupID) and all associated data")
     }
     
     // MARK: - Expense Operations

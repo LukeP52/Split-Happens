@@ -285,6 +285,32 @@ class GroupViewModel: ObservableObject {
         return nil
     }
     
+    // MARK: - Group Total Recalculation
+    
+    func recalculateAllGroupTotals() async {
+        for group in groups {
+            do {
+                let expenses = try await cloudKitManager.fetchExpensesAsModels(for: group.id)
+                let newTotal = expenses.reduce(0) { $0 + $1.totalAmount.safeValue }
+                
+                if abs(group.totalSpent - newTotal) > 0.01 {
+                    var updatedGroup = group
+                    updatedGroup.totalSpent = newTotal
+                    
+                    let savedGroup = try await cloudKitManager.saveGroup(updatedGroup)
+                    
+                    if let index = groups.firstIndex(where: { $0.id == group.id }) {
+                        await MainActor.run {
+                            groups[index] = savedGroup
+                        }
+                    }
+                }
+            } catch {
+                print("Failed to recalculate total for group \(group.id): \(error)")
+            }
+        }
+    }
+    
     // MARK: - Error Handling
     
     func clearError() {
