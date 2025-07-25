@@ -85,7 +85,7 @@ struct ExpenseDetailView: View {
                     }
                     .padding(20)
                     .background(AppColors.cardBackground)
-                    .elegantCard()
+                    .modernCard()
                     
                     // Payment Info Card
                     VStack(spacing: 16) {
@@ -126,7 +126,7 @@ struct ExpenseDetailView: View {
                     }
                     .padding(20)
                     .background(AppColors.cardBackground)
-                    .elegantCard()
+                    .modernCard()
                     
                     // Participants Card
                     VStack(spacing: 16) {
@@ -169,7 +169,7 @@ struct ExpenseDetailView: View {
                     }
                     .padding(20)
                     .background(AppColors.cardBackground)
-                    .elegantCard()
+                    .modernCard()
                     
                     // Split Details Card (if not equal split)
                     if expense.splitType != .equal && !expense.customSplits.isEmpty {
@@ -210,7 +210,7 @@ struct ExpenseDetailView: View {
                         }
                         .padding(20)
                         .background(AppColors.cardBackground)
-                        .elegantCard()
+                        .modernCard()
                     }
                 }
                 .padding(16)

@@ -11,6 +11,8 @@ import Combine
 
 @MainActor
 class GroupViewModel: ObservableObject {
+    static var shared: GroupViewModel?
+    
     @Published var groups: [Group] = []
     @Published var isLoading = false
     @Published var errorMessage: String?
@@ -19,9 +21,12 @@ class GroupViewModel: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     
     init() {
+        Self.shared = self
         setupNotificationObservers()
         Task {
             await loadGroups()
+            // Clean up any test groups on startup
+            await cleanupDeletedGroups()
         }
     }
     
@@ -246,7 +251,7 @@ class GroupViewModel: ObservableObject {
             seenGroupHashes.insert(contentHash)
         }
         
-        print("🔍 Deduplicated \\(groups.count) groups to \\(uniqueGroups.count) unique groups")
+        print("🔍 Deduplicated \(groups.count) groups to \(uniqueGroups.count) unique groups")
         return uniqueGroups
     }
     
@@ -308,6 +313,62 @@ class GroupViewModel: ObservableObject {
             } catch {
                 print("Failed to recalculate total for group \(group.id): \(error)")
             }
+        }
+    }
+    
+    // MARK: - Manual Cleanup
+    
+    func cleanupDeletedGroups() async {
+        do {
+            // Get all groups from CloudKit
+            let remoteGroups = try await cloudKitManager.fetchGroupsAsModels()
+            
+            // Find groups that should be deleted (Hawaii, Nuts, or any test groups)
+            let groupsToDelete = remoteGroups.filter { group in
+                let nameToCheck = group.name.lowercased()
+                return nameToCheck == "hawaii" || nameToCheck == "nuts" || nameToCheck == "test"
+            }
+            
+            if !groupsToDelete.isEmpty {
+                print("⚠️ Found \(groupsToDelete.count) old groups to delete: \(groupsToDelete.map { $0.name }.joined(separator: ", "))")
+                
+                // Delete each group
+                for group in groupsToDelete {
+                    do {
+                        let record = group.toCKRecord()
+                        try await cloudKitManager.deleteGroup(record)
+                        print("✅ Deleted old group: \(group.name)")
+                        
+                        // Also remove from local array immediately
+                        if let index = groups.firstIndex(where: { $0.id == group.id }) {
+                            groups.remove(at: index)
+                        }
+                    } catch {
+                        print("❌ Failed to delete group \(group.name): \(error)")
+                    }
+                }
+                
+                // Clean up local storage as well
+                let offlineManager = OfflineStorageManager.shared
+                var localGroups = offlineManager.loadGroups()
+                localGroups.removeAll { group in
+                    let nameToCheck = group.name.lowercased()
+                    return nameToCheck == "hawaii" || nameToCheck == "nuts" || nameToCheck == "test"
+                }
+                offlineManager.saveGroups(localGroups)
+                
+                // Clean up associated expenses
+                var localExpenses = offlineManager.loadExpenses()
+                let deletedGroupIDs = Set(groupsToDelete.map { $0.id })
+                localExpenses.removeAll { deletedGroupIDs.contains($0.groupReference) }
+                offlineManager.saveExpenses(localExpenses)
+                
+                print("✅ Cleanup completed")
+            } else {
+                print("✅ No old groups found to clean up")
+            }
+        } catch {
+            print("❌ Failed to cleanup old groups: \(error)")
         }
     }
     

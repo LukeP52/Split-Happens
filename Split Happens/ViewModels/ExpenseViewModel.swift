@@ -8,6 +8,7 @@
 import Foundation
 import SwiftUI
 import Combine
+import CloudKit
 
 @MainActor
 class ExpenseViewModel: ObservableObject {
@@ -109,14 +110,20 @@ class ExpenseViewModel: ObservableObject {
         )
         
         do {
+            // Step 1: Save expense and wait for completion
             let savedExpense = try await cloudKitManager.saveExpense(newExpense)
+            print("✅ Expense saved successfully: \(savedExpense.description)")
+            
+            // Step 2: Calculate new total by adding this expense to current total (no refetch needed!)
+            await updateGroupTotalWithNewExpense(groupID: groupID, expenseAmount: savedExpense.totalAmount.safeValue)
+            print("✅ Group total updated for group: \(groupID)")
+            
+            // Step 3: Add to local array (this will trigger UI update)
             expenses.append(savedExpense)
             
-            // Update the group's total spent amount
-            await updateGroupTotal(groupID: groupID)
-            
-            // Notify that groups data has changed so the main view refreshes
+            // Step 4: Notify that groups data has changed so the main view refreshes with correct total
             NotificationCenter.default.post(name: .groupsDidChange, object: nil)
+            print("✅ UI notified to refresh with updated totals")
         } catch {
             errorMessage = "Failed to create expense: \(error.localizedDescription)"
         }
@@ -129,16 +136,23 @@ class ExpenseViewModel: ObservableObject {
         errorMessage = nil
         
         do {
+            // Step 1: Save updated expense and wait for completion
             let savedExpense = try await cloudKitManager.saveExpense(updatedExpense)
+            print("✅ Expense updated successfully: \(savedExpense.description)")
+            
+            // Step 2: Calculate difference and update group total (no refetch needed!)
+            let amountDifference = savedExpense.totalAmount.safeValue - originalExpense.totalAmount.safeValue
+            await updateGroupTotalWithExpenseDifference(groupID: updatedExpense.groupReference, amountDifference: amountDifference)
+            print("✅ Group total updated for group: \(updatedExpense.groupReference)")
+            
+            // Step 3: Update local array (this will trigger UI update)
             if let index = expenses.firstIndex(where: { $0.id == originalExpense.id }) {
                 expenses[index] = savedExpense
             }
             
-            // Update the group's total spent amount (recalculate from all expenses)
-            await updateGroupTotal(groupID: updatedExpense.groupReference)
-            
-            // Notify that groups data has changed so the main view refreshes
+            // Step 4: Notify that groups data has changed so the main view refreshes with correct total
             NotificationCenter.default.post(name: .groupsDidChange, object: nil)
+            print("✅ UI notified to refresh with updated totals")
         } catch {
             errorMessage = "Failed to update expense: \(error.localizedDescription)"
         }
@@ -151,15 +165,21 @@ class ExpenseViewModel: ObservableObject {
         errorMessage = nil
         
         do {
+            // Step 1: Delete expense and wait for completion
             let record = expense.toCKRecord()
             try await cloudKitManager.deleteExpense(record)
+            print("✅ Expense deleted successfully: \(expense.description)")
+            
+            // Step 2: Subtract expense amount from group total (no refetch needed!)
+            await updateGroupTotalWithExpenseDifference(groupID: expense.groupReference, amountDifference: -expense.totalAmount.safeValue)
+            print("✅ Group total updated for group: \(expense.groupReference)")
+            
+            // Step 3: Remove from local array (this will trigger UI update)
             expenses.removeAll { $0.id == expense.id }
             
-            // Update the group's total spent amount (recalculate from all expenses)
-            await updateGroupTotal(groupID: expense.groupReference)
-            
-            // Notify that groups data has changed so the main view refreshes
+            // Step 4: Notify that groups data has changed so the main view refreshes with correct total
             NotificationCenter.default.post(name: .groupsDidChange, object: nil)
+            print("✅ UI notified to refresh with updated totals")
         } catch {
             errorMessage = "Failed to delete expense: \(error.localizedDescription)"
         }
@@ -169,37 +189,159 @@ class ExpenseViewModel: ObservableObject {
     
     // MARK: - Group Total Management
     
-    private func updateGroupTotal(groupID: String) async {
+    private func updateGroupTotalWithNewExpense(groupID: String, expenseAmount: Double) async {
         do {
-            // Fetch the current group
-            guard var group = try await cloudKitManager.fetchGroup(by: groupID) else {
-                print("Could not find group with ID: \(groupID)")
+            print("💰 Updating group total by adding expense amount: \(expenseAmount)")
+            
+            // First, get the most current total by fetching the fresh group from CloudKit
+            guard let freshGroup = try await cloudKitManager.fetchGroup(by: groupID) else {
+                print("❌ Group not found: \(groupID)")
                 return
             }
             
-            // Recalculate total from all expenses
-            let allExpenses = try await cloudKitManager.fetchExpensesAsModels(for: groupID)
-            let newTotal = allExpenses.reduce(0) { $0 + $1.totalAmount.safeValue }
+            // Use the fresh total from CloudKit as the starting point
+            let currentTotal = freshGroup.totalSpent
+            let newTotal = currentTotal + expenseAmount
+            print("💰 New total calculated: \(currentTotal) + \(expenseAmount) = \(newTotal)")
             
-            // Update the group with new total
-            group.totalSpent = newTotal
+            // Update the group model with the new total
+            var updatedGroup = freshGroup
+            updatedGroup.totalSpent = newTotal
+            updatedGroup.lastActivity = Date()
             
-            // Save the updated group
-            let savedGroup = try await cloudKitManager.saveGroup(group)
+            // Save back to CloudKit and wait for completion
+            let savedGroup = try await cloudKitManager.saveGroup(updatedGroup)
+            print("✅ Group saved to CloudKit with new total: \(savedGroup.totalSpent)")
             
-            // Update local cache
+            // Update local cache synchronously and wait for completion
             await MainActor.run {
+                // Update in GroupViewModel if available
+                if let groupViewModel = GroupViewModel.shared {
+                    if let index = groupViewModel.groups.firstIndex(where: { $0.id == groupID }) {
+                        groupViewModel.groups[index] = savedGroup
+                        print("✅ Updated GroupViewModel cache")
+                    }
+                }
+                
+                // Update offline storage
                 let offlineManager = OfflineStorageManager.shared
                 var localGroups = offlineManager.loadGroups()
                 if let index = localGroups.firstIndex(where: { $0.id == groupID }) {
                     localGroups[index] = savedGroup
                     offlineManager.saveGroups(localGroups)
+                    print("✅ Updated offline storage cache")
                 }
             }
             
-            print("Updated group \(groupID) total to: \(newTotal)")
+            print("✅ Group total update completed: \(groupID) -> \(newTotal)")
         } catch {
-            print("Failed to update group total: \(error.localizedDescription)")
+            print("❌ Failed to update group total with new expense: \(error)")
+        }
+    }
+    
+    private func updateGroupTotalWithExpenseDifference(groupID: String, amountDifference: Double) async {
+        do {
+            print("💰 Updating group total with difference: \(amountDifference)")
+            
+            // First, get the most current total by fetching the fresh group from CloudKit
+            guard let freshGroup = try await cloudKitManager.fetchGroup(by: groupID) else {
+                print("❌ Group not found: \(groupID)")
+                return
+            }
+            
+            // Use the fresh total from CloudKit as the starting point
+            let currentTotal = freshGroup.totalSpent
+            let newTotal = currentTotal + amountDifference
+            print("💰 New total calculated: \(currentTotal) + \(amountDifference) = \(newTotal)")
+            
+            // Update the group model with the new total
+            var updatedGroup = freshGroup
+            updatedGroup.totalSpent = newTotal
+            updatedGroup.lastActivity = Date()
+            
+            // Save back to CloudKit and wait for completion
+            let savedGroup = try await cloudKitManager.saveGroup(updatedGroup)
+            print("✅ Group saved to CloudKit with new total: \(savedGroup.totalSpent)")
+            
+            // Update local cache synchronously and wait for completion
+            await MainActor.run {
+                // Update in GroupViewModel if available
+                if let groupViewModel = GroupViewModel.shared {
+                    if let index = groupViewModel.groups.firstIndex(where: { $0.id == groupID }) {
+                        groupViewModel.groups[index] = savedGroup
+                        print("✅ Updated GroupViewModel cache")
+                    }
+                }
+                
+                // Update offline storage
+                let offlineManager = OfflineStorageManager.shared
+                var localGroups = offlineManager.loadGroups()
+                if let index = localGroups.firstIndex(where: { $0.id == groupID }) {
+                    localGroups[index] = savedGroup
+                    offlineManager.saveGroups(localGroups)
+                    print("✅ Updated offline storage cache")
+                }
+            }
+            
+            print("✅ Group total update completed with difference: \(groupID) -> \(newTotal)")
+        } catch {
+            print("❌ Failed to update group total with difference: \(error)")
+        }
+    }
+    
+    private func forceUpdateGroupTotal(groupID: String) async {
+        do {
+            print("🔄 Starting group total update for: \(groupID)")
+            
+            // Fetch the group using the public method
+            guard let currentGroup = try await cloudKitManager.fetchGroup(by: groupID) else {
+                print("❌ Group not found: \(groupID)")
+                return
+            }
+            
+            // Calculate new total from all expenses (fetch fresh from CloudKit)
+            let allExpenses = try await cloudKitManager.fetchExpensesAsModels(for: groupID)
+            let newTotal = allExpenses.reduce(0) { $0 + $1.totalAmount.safeValue }
+            print("🔄 Calculated new total: \(newTotal) from \(allExpenses.count) expenses")
+            
+            // Only update if the total has actually changed
+            guard abs(currentGroup.totalSpent - newTotal) > 0.01 else {
+                print("✅ Group total already up to date: \(newTotal)")
+                return
+            }
+            
+            // Update the group model
+            var updatedGroup = currentGroup
+            updatedGroup.totalSpent = newTotal
+            updatedGroup.lastActivity = Date()
+            
+            // Save back to CloudKit and wait for completion
+            let savedGroup = try await cloudKitManager.saveGroup(updatedGroup)
+            print("✅ Group saved to CloudKit with new total: \(savedGroup.totalSpent)")
+            
+            // Update local cache synchronously and wait for completion
+            await MainActor.run {
+                // Update in GroupViewModel if available
+                if let groupViewModel = GroupViewModel.shared {
+                    if let index = groupViewModel.groups.firstIndex(where: { $0.id == groupID }) {
+                        groupViewModel.groups[index] = savedGroup
+                        print("✅ Updated GroupViewModel cache")
+                    }
+                }
+                
+                // Update offline storage
+                let offlineManager = OfflineStorageManager.shared
+                var localGroups = offlineManager.loadGroups()
+                if let index = localGroups.firstIndex(where: { $0.id == groupID }) {
+                    localGroups[index] = savedGroup
+                    offlineManager.saveGroups(localGroups)
+                    print("✅ Updated offline storage cache")
+                }
+            }
+            
+            print("✅ Group total update completed: \(groupID) -> \(newTotal)")
+        } catch {
+            print("❌ Failed to update group total: \(error)")
         }
     }
     

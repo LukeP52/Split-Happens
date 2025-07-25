@@ -388,7 +388,7 @@ class OfflineStorageManager: ObservableObject {
         }
     }
     
-    private func syncRemoteChanges() async {
+    func syncRemoteChanges() async {
         let cloudKitManager = CloudKitManager.shared
         
         do {
@@ -399,25 +399,34 @@ class OfflineStorageManager: ObservableObject {
             
             // Fetch all remote groups
             let remoteGroups = try await cloudKitManager.fetchGroupsAsModels()
+            print("✅ Fetched \(remoteGroups.count) remote groups")
+            
+            // Get remote group IDs
             let remoteGroupIDs = Set(remoteGroups.map { $0.id })
             
             // Load local groups
             var localGroups = loadGroups()
             let localGroupIDs = Set(localGroups.map { $0.id })
             
-            // Find groups that exist locally but not in CloudKit (deleted)
+            // Find deleted groups (exist locally but not remotely)
             let deletedGroupIDs = localGroupIDs.subtracting(remoteGroupIDs)
             
             if !deletedGroupIDs.isEmpty {
-                print("🗑️ Removing \(deletedGroupIDs.count) deleted groups from local cache")
+                print("🗑️ Found \(deletedGroupIDs.count) groups to delete locally")
                 
-                // Remove deleted groups and their expenses
+                // Remove deleted groups
                 localGroups.removeAll { deletedGroupIDs.contains($0.id) }
-                saveGroups(localGroups)
                 
-                // Also remove associated expenses
+                // Remove associated expenses
                 var localExpenses = loadExpenses()
+                let expensesBeforeCount = localExpenses.count
                 localExpenses.removeAll { deletedGroupIDs.contains($0.groupReference) }
+                let deletedExpensesCount = expensesBeforeCount - localExpenses.count
+                
+                print("🗑️ Deleted \(deletedExpensesCount) orphaned expenses")
+                
+                // Save cleaned data
+                saveGroups(localGroups)
                 saveExpenses(localExpenses)
                 
                 // Clear sync status for deleted items
@@ -427,15 +436,26 @@ class OfflineStorageManager: ObservableObject {
                 saveSyncStatusItems()
             }
             
-            // Now sync remaining groups and add new ones
+            // Validate and deduplicate groups before processing
             let validGroups = remoteGroups.filter { group in
-                !group.name.isEmpty && group.participants.count >= 1
+                let isValid = !group.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+                              group.participants.count >= 1 &&
+                              group.totalSpent.isFinite &&
+                              group.totalSpent >= 0
+                if !isValid {
+                    print("⚠️ Skipping invalid group: \(group.name)")
+                }
+                return isValid
             }
             
-            let mergedGroups = mergeGroups(local: localGroups, remote: validGroups)
+            // Deduplicate groups
+            let uniqueGroups = deduplicateGroups(validGroups)
+            
+            let mergedGroups = mergeGroups(local: localGroups, remote: uniqueGroups)
+            print("🔀 Merged to \(mergedGroups.count) groups")
             saveGroups(mergedGroups)
             
-            // Sync expenses for each group
+            // Sync expenses for valid groups
             await syncExpensesWithConcurrency(groups: mergedGroups, cloudKitManager: cloudKitManager)
             
             print("✅ Sync completed successfully")
@@ -462,6 +482,8 @@ class OfflineStorageManager: ObservableObject {
             }
         }
         
+        // Fix the string interpolation in the log
+        print("🔍 Deduplicated \(groups.count) groups to \(uniqueGroups.count) unique groups")
         return uniqueGroups
     }
     

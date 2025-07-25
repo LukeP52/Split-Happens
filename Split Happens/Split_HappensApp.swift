@@ -13,12 +13,15 @@ struct Split_HappensApp: App {
     @StateObject private var subscriptionManager = CloudKitSubscriptionManager.shared
     @StateObject private var offlineManager = OfflineStorageManager.shared
     
+    init() {
+        // Configure app appearance
+        configureAppearance()
+    }
+    
     var body: some Scene {
         WindowGroup {
             ContentView()
                 .preferredColorScheme(.dark)
-                .background(AppColors.background)
-                .accentColor(AppColors.accent)
                 .task {
                     await setupApp()
                 }
@@ -43,6 +46,42 @@ struct Split_HappensApp: App {
                     }
                 }
         }
+    }
+    
+    private func configureAppearance() {
+        // Configure navigation bar appearance
+        let navBarAppearance = UINavigationBarAppearance()
+        navBarAppearance.configureWithOpaqueBackground()
+        navBarAppearance.backgroundColor = UIColor(AppColors.background)
+        navBarAppearance.titleTextAttributes = [
+            .foregroundColor: UIColor(AppColors.primaryText),
+            .font: UIFont.systemFont(ofSize: 17, weight: .semibold)
+        ]
+        navBarAppearance.largeTitleTextAttributes = [
+            .foregroundColor: UIColor(AppColors.primaryText),
+            .font: UIFont.systemFont(ofSize: 34, weight: .bold)
+        ]
+        navBarAppearance.shadowColor = .clear
+        
+        UINavigationBar.appearance().standardAppearance = navBarAppearance
+        UINavigationBar.appearance().compactAppearance = navBarAppearance
+        UINavigationBar.appearance().scrollEdgeAppearance = navBarAppearance
+        UINavigationBar.appearance().tintColor = UIColor(AppColors.accent)
+        
+        // Configure tab bar appearance
+        let tabBarAppearance = UITabBarAppearance()
+        tabBarAppearance.configureWithOpaqueBackground()
+        tabBarAppearance.backgroundColor = UIColor(AppColors.tabBarBackground)
+        
+        UITabBar.appearance().standardAppearance = tabBarAppearance
+        UITabBar.appearance().scrollEdgeAppearance = tabBarAppearance
+        UITabBar.appearance().tintColor = UIColor(AppColors.accent)
+        
+        // Configure other UI elements
+        UITableView.appearance().backgroundColor = UIColor(AppColors.background)
+        UITableViewCell.appearance().backgroundColor = UIColor(AppColors.cardBackground)
+        UITextField.appearance().tintColor = UIColor(AppColors.accent)
+        UITextView.appearance().tintColor = UIColor(AppColors.accent)
     }
     
     // MARK: - App Lifecycle
@@ -225,34 +264,12 @@ class NotificationDelegate: NSObject, UNUserNotificationCenterDelegate, Observab
     }
 }
 
-// MARK: - App Delegate for Push Notifications
-
-class AppDelegate: NSObject, UIApplicationDelegate {
-    func application(
-        _ application: UIApplication,
-        didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
-    ) {
-        print("Registered for remote notifications")
-        print("Device token: \(deviceToken.map { String(format: "%02.2hhx", $0) }.joined())")
-    }
-    
-    func application(
-        _ application: UIApplication,
-        didFailToRegisterForRemoteNotificationsWithError error: Error
-    ) {
-        print("Failed to register for remote notifications: \(error)")
-    }
-    
-    func application(
-        _ application: UIApplication,
-        didReceiveRemoteNotification userInfo: [AnyHashable: Any],
-        fetchCompletionHandler completionHandler: @escaping (UIBackgroundFetchResult) -> Void
-    ) {
-        print("Received remote notification in background")
-        
-        Task {
-            await CloudKitSubscriptionManager.shared.handleRemoteNotification(userInfo)
-            completionHandler(.newData)
-        }
+// Updated theme-aware components
+extension View {
+    func withModernStyle() -> some View {
+        self
+            .preferredColorScheme(.dark)
+            .accentColor(AppColors.accent)
+            .background(AppColors.background)
     }
 }

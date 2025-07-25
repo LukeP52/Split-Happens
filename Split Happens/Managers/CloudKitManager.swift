@@ -260,37 +260,40 @@ class CloudKitManager: ObservableObject {
     func deleteGroup(_ record: CKRecord) async throws {
         let groupID = record.recordID.recordName
         
-        // Delete all expenses for this group first
-        let expenses = try await fetchExpensesAsModels(for: groupID)
-        for expense in expenses {
-            let expenseRecord = expense.toCKRecord()
-            try await deleteExpense(expenseRecord)
+        // First, fetch and delete all expenses for this group
+        do {
+            let expenses = try await fetchExpenses(for: record)
+            for expenseRecord in expenses {
+                try await performWithRetry {
+                    try await self.database.deleteRecord(withID: expenseRecord.recordID)
+                }
+            }
+            print("✅ Deleted \(expenses.count) expenses for group \(groupID)")
+        } catch {
+            print("⚠️ Failed to delete expenses for group: \(error)")
         }
         
-        // Delete the group from CloudKit
+        // Delete from CloudKit
         try await performWithRetry {
             try await self.database.deleteRecord(withID: record.recordID)
         }
+        print("✅ Deleted group \(groupID) from CloudKit")
         
-        // Clean up local storage immediately
+        // Delete from local storage
         await MainActor.run {
             let offlineManager = OfflineStorageManager.shared
-            
-            // Remove group
             var localGroups = offlineManager.loadGroups()
             localGroups.removeAll { $0.id == groupID }
             offlineManager.saveGroups(localGroups)
             
-            // Remove associated expenses
+            // Also delete all associated expenses
             var localExpenses = offlineManager.loadExpenses()
             localExpenses.removeAll { $0.groupReference == groupID }
             offlineManager.saveExpenses(localExpenses)
             
-            // Clear sync status
+            // Update sync status
             offlineManager.updateSyncStatus(for: groupID, status: .synced)
         }
-        
-        print("✅ Deleted group \(groupID) and all associated data")
     }
     
     // MARK: - Expense Operations
@@ -336,7 +339,9 @@ class CloudKitManager: ObservableObject {
     
     func fetchExpenses(for group: CKRecord) async throws -> [CKRecord] {
         return try await performWithRetry {
-            let predicate = NSPredicate(format: "groupReference == %@", group.recordID.recordName)
+            // Create proper reference to match how expenses are saved
+            let groupReference = CKRecord.Reference(recordID: group.recordID, action: .none)
+            let predicate = NSPredicate(format: "groupReference == %@", groupReference)
             let query = CKQuery(recordType: "Expense", predicate: predicate)
             query.sortDescriptors = [NSSortDescriptor(key: "date", ascending: false)]
             
@@ -433,10 +438,8 @@ class CloudKitManager: ObservableObject {
         let recordID = CKRecord.ID(recordName: group.id)
         
         do {
-            // Try to fetch existing record
-            let existingRecord = try await performWithRetry {
-                try await self.database.record(for: recordID)
-            }
+            // Try to fetch existing record WITHOUT retry logic since "not found" is a valid response
+            let existingRecord = try await self.database.record(for: recordID)
             
             // Update existing record
             existingRecord["name"] = validatedGroup.name
@@ -459,8 +462,9 @@ class CloudKitManager: ObservableObject {
             return updatedGroup
             
         } catch {
-            // If record doesn't exist, create new one
+            // Check if it's a "record not found" error - this is expected for new groups
             if let ckError = error as? CKError, ckError.code == .unknownItem {
+                print("📝 Record doesn't exist, creating new group: \(validatedGroup.name)")
                 let newRecord = validatedGroup.toCKRecord()
                 
                 let savedRecord = try await performWithRetry {
@@ -473,9 +477,11 @@ class CloudKitManager: ObservableObject {
                 
                 print("✅ Created new group: \(newGroup.name)")
                 return newGroup
+            } else {
+                // For other errors, throw them
+                print("❌ Unexpected error while checking/saving group: \(error)")
+                throw CloudKitManagerError.unknown(error)
             }
-            
-            throw error
         }
     }
     

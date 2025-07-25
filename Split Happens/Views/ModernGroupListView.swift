@@ -7,6 +7,7 @@ struct ModernGroupListView: View {
     @StateObject private var offlineManager = OfflineStorageManager.shared
     @State private var showingCreateGroup = false
     @State private var isLoadingGroups = false
+    @State private var lastLoadTime = Date.distantPast
     
     var filteredGroups: [Group] {
         groupViewModel.groups.filter { $0.isActive }
@@ -106,8 +107,24 @@ struct ModernGroupListView: View {
                 
                 Spacer()
                 
-                // Profile button
-                Button(action: {}) {
+                // Profile button with menu
+                Menu {
+                    Button(action: {
+                        Task {
+                            await groupViewModel.cleanupDeletedGroups()
+                        }
+                    }) {
+                        Label("Clean Up Old Groups", systemImage: "trash")
+                    }
+                    
+                    Button(action: {
+                        Task {
+                            await groupViewModel.recalculateAllGroupTotals()
+                        }
+                    }) {
+                        Label("Recalculate Totals", systemImage: "arrow.triangle.2.circlepath")
+                    }
+                } label: {
                     Circle()
                         .fill(AppColors.tertiaryBackground)
                         .frame(width: 48, height: 48)
@@ -173,6 +190,14 @@ struct ModernGroupListView: View {
     }
     
     private func loadGroupsOfflineFirst() async {
+        // Debounce - don't load if we just loaded within 2 seconds
+        let now = Date()
+        guard now.timeIntervalSince(lastLoadTime) > 2.0 else {
+            print("⏭️ Skipping group load - too soon after last load")
+            return
+        }
+        lastLoadTime = now
+        
         guard !isLoadingGroups else { return }
         isLoadingGroups = true
         
