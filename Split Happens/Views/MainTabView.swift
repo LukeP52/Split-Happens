@@ -60,7 +60,7 @@ struct MainTabView: View {
 // MARK: - Placeholder screens
 
 struct ModernFriendsView: View {
-    @StateObject private var viewModel = FriendsViewModel()
+    @StateObject private var viewModel = FriendBalanceViewModel()
     
     var body: some View {
         NavigationView {
@@ -75,13 +75,13 @@ struct ModernFriendsView: View {
                         // Header summary
                         if !viewModel.friendBalances.isEmpty {
                             VStack(alignment: .leading, spacing: 8) {
-                                if viewModel.totalNegative < -0.01 {
-                                    Text("You are owed \(formatCurrency(abs(viewModel.totalNegative))) overall")
+                                if viewModel.totalOwed > 0.01 {
+                                    Text("You are owed \(formatCurrency(viewModel.totalOwed)) overall")
                                         .font(AppFonts.title3)
                                         .foregroundColor(AppColors.success)
                                 }
-                                if viewModel.totalPositive > 0.01 {
-                                    Text("You owe \(formatCurrency(viewModel.totalPositive)) overall")
+                                if viewModel.totalOwe > 0.01 {
+                                    Text("You owe \(formatCurrency(viewModel.totalOwe)) overall")
                                         .font(AppFonts.title3)
                                         .foregroundColor(AppColors.error)
                                 }
@@ -91,7 +91,7 @@ struct ModernFriendsView: View {
                         }
                         
                         ForEach(viewModel.friendBalances) { balance in
-                            FriendBalanceRow(balance: balance)
+                            MainTabFriendBalanceRow(balance: balance)
                                 .listRowSeparator(.hidden)
                                 .listRowBackground(Color.clear)
                         }
@@ -112,7 +112,7 @@ struct ModernFriendsView: View {
     }
 }
 
-struct FriendBalanceRow: View {
+struct MainTabFriendBalanceRow: View {
     let balance: FriendBalance
     
     var body: some View {
